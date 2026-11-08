@@ -1,0 +1,265 @@
+pkill -9 node 2>/dev/null && rm -rf ~/chess-lab && mkdir -p ~/chess-lab/public && cd ~/chess-lab && npm init -y && npm install express express-ws chess.js && cat << 'EOF' > server.js
+const express = require('express');
+const { spawn } = require('child_process');
+const { Chess } = require('chess.js');
+const app = express();
+const expressWs = require('express-ws')(app);
+
+app.use(express.static('public'));
+
+app.ws('/stockfish', function(ws, req) {
+    const sf = spawn('/data/data/com.termux/files/home/stockfish');
+    let chess = new Chess();
+    let isSelfPlay = false;
+    let isThinking = false;
+    let buffer = '';
+
+    sf.stdout.on('data', (data) => {
+        buffer += data.toString();
+        let lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (let line of lines) {
+            ws.send(line + '\n');
+
+            if (isSelfPlay && line.startsWith('bestmove')) {
+                const parts = line.split(' ');
+                const moveStr = parts[1];
+                if (moveStr && !isThinking) {
+                    isThinking = true;
+                    try {
+                        const move = chess.move(moveStr);
+                        if (move) {
+                            ws.send(JSON.stringify({
+                                type: 'ai_move',
+                                fen: chess.fen(),
+                                move: moveStr,
+                                turn: chess.turn()
+                            }));
+
+                            setTimeout(() => {
+                                isThinking = false;
+                                if (isSelfPlay && !chess.isGameOver()) {
+                                    runNextMove();
+                                }
+                            }, 300);
+                        } else {
+                            isThinking = false;
+                        }
+                    } catch (e) {
+                        isThinking = false;
+                    }
+                }
+            }
+        }
+    });
+
+    function runNextMove() {
+        if (!isSelfPlay || chess.isGameOver() || isThinking) return;
+        sf.stdin.write('position fen ' + chess.fen() + '\n');
+        sf.stdin.write('go movetime 500\n');
+    }
+
+    ws.on('message', (msg) => {
+        if (msg === 'START_BOT_VS_BOT') {
+            chess.reset();
+            isSelfPlay = true;
+            isThinking = false;
+            buffer = '';
+            sf.stdin.write('ucinewgame\n');
+            setTimeout(runNextMove, 200);
+        } else if (msg === 'STOP_BOT_VS_BOT') {
+            isSelfPlay = false;
+            isThinking = false;
+        } else {
+            sf.stdin.write(msg + '\n');
+        }
+    });
+
+    ws.on('close', () => {
+        isSelfPlay = false;
+        isThinking = false;
+        sf.kill();
+    });
+});
+
+app.listen(3030, '0.0.0.0', () => {
+    console.log('Server chạy cục bộ tại cổng 3030');
+});
+EOF
+
+cat << 'EOF' > public/index.html
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess Lab - Local Stockfish</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+</head>
+<body class="bg-slate-900 text-white min-h-screen flex flex-col items-center justify-center p-4">
+    <div class="max-w-md w-full bg-slate-800 p-6 rounded-2xl shadow-xl flex flex-col items-center border border-slate-700">
+        <h1 class="text-2xl font-bold mb-3 text-emerald-400">Chess Lab Local</h1>
+        
+        <!-- Bàn cờ 8x8 chuẩn màu -->
+        <div id="board" style="display: grid; grid-template-columns: repeat(8, 40px); grid-template-rows: repeat(8, 40px); width: 320px; height: 320px; border: 4px solid #475569; border-radius: 8px; overflow: hidden; margin-bottom: 15px; background: #334155;"></div>
+        
+        <div id="status" class="mb-4 text-sm text-slate-300 font-medium text-center px-3 py-2 bg-slate-700/50 rounded-xl w-full">Đang khởi tạo bàn cờ...</div>
+        
+        <div class="flex gap-2 w-full mb-2">
+            <button id="botVsBotBtn" class="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl font-semibold transition shadow-lg">🤖 Bot vs Bot</button>
+            <button id="resetBtn" class="px-4 py-2.5 bg-slate-700 hover:bg-slate-600 rounded-xl font-semibold transition">Ván mới</button>
+        </div>
+        <button id="reloadBoardBtn" class="w-full py-2.5 bg-amber-600 hover:bg-amber-500 rounded-xl font-semibold transition shadow-lg">🔄 Tải lại bàn cờ</button>
+    </div>
+
+    <script>
+        var board = [
+            ['r','n','b','q','k','b','n','r'],
+            ['p','p','p','p','p','p','p','p'],
+            ['','','','','','','',''],
+            ['','','','','','','',''],
+            ['','','','','','','',''],
+            ['','','','','','','',''],
+            ['P','P','P','P','P','P','P','P'],
+            ['R','N','B','Q','K','B','N','R']
+        ];
+
+        var turn = 'w';
+        var selectedCoord = null;
+        var isBotBattle = false;
+        var isEngineReady = false;
+
+        var piecesUnicode = {
+            'p': '♟', 'r': '♜', 'n': '♞', 'b': '♝', 'q': '♛', 'k': '♚',
+            'P': '♙', 'R': '♖', 'N': '♘', 'B': '♗', 'Q': '♕', 'K': '♔'
+        };
+
+        function drawBoard() {
+            var html = '';
+            for (var r = 0; r < 8; r++) {
+                for (var c = 0; c < 8; c++) {
+                    var isDark = (r + c) % 2 === 1;
+                    var bg = isDark ? '#b58863' : '#f0d9b5';
+                    if (selectedCoord && selectedCoord.r === r && selectedCoord.c === c) {
+                        bg = '#f6f669';
+                    }
+                    var p = board[r][c];
+                    var symbol = p ? piecesUnicode[p] : '';
+                    html += '<div onclick="clickSquare(' + r + ', ' + c + ')" style="width: 40px; height: 40px; background-color: ' + bg + '; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; cursor: pointer; user-select: none; color: #111;">' + symbol + '</div>';
+                }
+            }
+            $('#board').html(html);
+        }
+
+        const ws = new WebSocket('ws://' + window.location.host + '/stockfish');
+
+        ws.onopen = function() {
+            ws.send('uci');
+        };
+
+        function loadFen(fen) {
+            var rows = fen.split(' ')[0].split('/');
+            var newBoard = [];
+            for (var r = 0; r < rows.length; r++) {
+                var rowStr = rows[r];
+                var rowArr = [];
+                for (var i = 0; i < rowStr.length; i++) {
+                    var ch = rowStr[i];
+                    if (!isNaN(ch)) {
+                        for (var k = 0; k < parseInt(ch); k++) {
+                            rowArr.push('');
+                        }
+                    } else {
+                        rowArr.push(ch);
+                    }
+                }
+                newBoard.push(rowArr);
+            }
+            board = newBoard;
+        }
+
+        ws.onmessage = function(event) {
+            try {
+                let data = JSON.parse(event.data);
+                if (data.type === 'ai_move') {
+                    loadFen(data.fen);
+                    turn = data.turn;
+                    drawBoard();
+                    $('#status').text('🤖 Bot vs Bot | Lượt đi: ' + (turn === 'w' ? 'Trắng' : 'Đen'));
+                    return;
+                }
+            } catch(e) {}
+
+            var line = event.data;
+            if (line.includes('uciok')) {
+                isEngineReady = true;
+                $('#status').text('Bàn cờ sẵn sàng & Bot Stockfish đã kết nối!');
+            }
+        };
+
+        ws.onerror = function() {
+            $('#status').text('Bàn cờ sẵn sàng (Chế độ chơi cục bộ)');
+        };
+
+        window.clickSquare = function(r, c) {
+            if (isBotBattle) return;
+            var p = board[r][c];
+            if (!selectedCoord) {
+                if (p !== '' && ((turn === 'w' && p === p.toUpperCase()) || (turn === 'b' && p === p.toLowerCase()))) {
+                    selectedCoord = {r: r, c: c};
+                    drawBoard();
+                }
+            } else {
+                board[r][c] = board[selectedCoord.r][selectedCoord.c];
+                board[selectedCoord.r][selectedCoord.c] = '';
+                selectedCoord = null;
+                turn = turn === 'w' ? 'b' : 'w';
+                drawBoard();
+                $('#status').text('Lượt đi: ' + (turn === 'w' ? 'Trắng' : 'Đen'));
+            }
+        };
+
+        $('#botVsBotBtn').click(function() {
+            isBotBattle = true;
+            $('#status').text('🤖 Bot vs Bot đang chạy...');
+            ws.send('START_BOT_VS_BOT');
+        });
+
+        $('#resetBtn').click(function() {
+            isBotBattle = false;
+            ws.send('STOP_BOT_VS_BOT');
+            board = [
+                ['r','n','b','q','k','b','n','r'],
+                ['p','p','p','p','p','p','p','p'],
+                ['','','','','','','',''],
+                ['','','','','','','',''],
+                ['','','','','','','',''],
+                ['','','','','','','',''],
+                ['P','P','P','P','P','P','P','P'],
+                ['R','N','B','Q','K','B','N','R']
+            ];
+            turn = 'w';
+            selectedCoord = null;
+            drawBoard();
+            $('#status').text('Ván mới bắt đầu! Lượt đi: Trắng');
+        });
+
+        $('#reloadBoardBtn').click(function() {
+            selectedCoord = null;
+            drawBoard();
+            $('#status').text('Đã tải lại bàn cờ! Lượt đi: ' + (turn === 'w' ? 'Trắng' : 'Đen'));
+        });
+
+        $(document).ready(function() {
+            drawBoard();
+            $('#status').text('Bàn cờ đã hiển thị thành công!');
+        });
+    </script>
+</body>
+</html>
+EOF
+
+nohup node server.js > /dev/null 2>&1 &
+echo "=== KHỞI ĐỘNG THÀNH CÔNG ==="
